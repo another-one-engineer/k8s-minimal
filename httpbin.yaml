@@ -1,0 +1,199 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-httpbin
+---
+# deployment evenly spread, with liveness/readiness probes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: httpbin
+  namespace: demo-httpbin
+  labels:
+    app: httpbin
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: httpbin
+  template:
+    metadata:
+      labels:
+        app: httpbin
+    spec:
+      # distribute pods across nodes by node hostname (more aggressive than defaults https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/#internal-default-constraints)
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: httpbin
+      containers:
+        - name: httpbin
+          image: kennethreitz/httpbin:latest
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - mountPath: /tmp
+              name: cache-volume
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          # ensure min privileges 
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false # failing with true app is designed to have permissions to write at least to /tmp
+            runAsNonRoot: true
+            runAsUser: 1000
+          livenessProbe:
+            httpGet:
+              path: /status/200
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /get
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+      volumes:
+        - name: cache-volume
+          emptyDir:
+            sizeLimit: 500Mi #ensure pod will not utilize all free space from node disk
+      restartPolicy: Always
+---
+#ClusterIP Service with Topology Aware Routing
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpbin
+  namespace: demo-httpbin
+  annotations:
+    # needed for spreading traffic evenly by zone 
+    service.kubernetes.io/topology-mode: Auto 
+spec:
+  selector:
+    app: httpbin
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+# Ingress (nginx) for accessing traffic from outside 
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: httpbin-ingress
+  namespace: demo-httpbin
+  annotations:
+    #force HTTPS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    #enable HSTS (prevents protocol downgrade attacks)
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: httpbin.test
+      http:
+        paths:
+          - path: /
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: httpbin
+                port:
+                  number: 80
+---
+#implementation of zero-trust approach with NetworkPolicy: only ingress-controller pods may reach httpbin. No other pods (even same-namespace).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: httpbin-only-from-ingress
+  namespace: demo-httpbin
+spec:
+  podSelector:
+    matchLabels:
+      app: httpbin
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx  # assume this is ingress ns
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx       # default label for NGINX ingress controller pods
+      ports:
+        - protocol: TCP
+          port: 80
+  egress:
+    #minimal egress: DNS + HTTP/HTTPS outbound.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+---
+#PodDisruptionBudget: must(!) in prod envs to not be impacted by unpredicted node drains
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: httpbin-pdb
+  namespace: demo-httpbin
+spec:
+  minAvailable: 50%
+  selector:
+    matchLabels:
+      app: httpbin
+---
+#HorizontalPodAutoscaler: CPU-based autoscaling, better to use KEDA and saturation instead
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: httpbin-hpa
+  namespace: demo-httpbin
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: httpbin
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+
+
